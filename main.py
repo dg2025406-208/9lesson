@@ -5,6 +5,7 @@ import pandas as pd
 import plotly.express as px
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import silhouette_score
 
 # --------------------------------------------------
 # 기본 설정
@@ -39,6 +40,7 @@ ATTR_LABELS = {
     "롱런 지수": "롱런 지수",
 }
 
+CLUSTER_SYMBOLS = ["㉮", "㉯", "㉰", "㉱", "㉲", "㉳", "㉴"]
 
 
 @st.cache_data
@@ -49,7 +51,6 @@ def load_data():
     if missing_columns:
         raise ValueError(f"데이터에 필요한 열이 없습니다: {', '.join(missing_columns)}")
 
-    # 사용할 숫자 열은 숫자로 변환. 변환되지 않는 값은 결측치 처리.
     numeric_cols = [
         "first_scrn",
         "first_week_audi",
@@ -61,7 +62,7 @@ def load_data():
 
     total_count = len(df)
 
-    # 유형 분류에 필요한 네 속성 만들기
+    # 유형 분류에 사용할 네 속성
     work = df.copy()
     work["스크린 수"] = work["first_scrn"].apply(
         lambda x: math.log10(x) if pd.notna(x) and x > 0 else pd.NA
@@ -70,8 +71,6 @@ def load_data():
         lambda x: math.log10(x) if pd.notna(x) and x > 0 else pd.NA
     )
     work["10위권 일수"] = work["days_in_top10"]
-
-    # 첫 주 관객이 0인 경우 제외한 뒤 롱런 지수 계산
     work["롱런 지수"] = work.apply(
         lambda row: min(row["total_audi"] / row["first_week_audi"], 20)
         if pd.notna(row["total_audi"])
@@ -92,25 +91,31 @@ def load_data():
     return work, total_count, clustered_count
 
 
-def run_clustering(df, selected_attrs):
+def run_clustering(df, selected_attrs, n_clusters):
     scaler = StandardScaler()
-    X = scaler.fit_transform(df[selected_attrs])
+    x_standardized = scaler.fit_transform(df[selected_attrs])
 
     model = KMeans(
-        n_clusters=3,
+        n_clusters=n_clusters,
         random_state=42,
         n_init=10,
     )
-    raw_labels = model.fit_predict(X)
+    raw_labels = model.fit_predict(x_standardized)
 
     result = df.copy()
     result["cluster_raw"] = raw_labels
 
-    # 누적 관객 평균이 큰 묶음부터 ㉮, ㉯, ㉰
-    mean_total = result.groupby("cluster_raw")["total_audi"].mean().sort_values(ascending=False)
+    # 누적 관객 평균이 큰 묶음부터 ㉮, ㉯, ㉰ ... 순서로 표시
+    mean_total = (
+        result.groupby("cluster_raw")["total_audi"]
+        .mean()
+        .sort_values(ascending=False)
+    )
     label_map = {
         raw_label: display_label
-        for raw_label, display_label in zip(mean_total.index, ["㉮", "㉯", "㉰"])
+        for raw_label, display_label in zip(
+            mean_total.index, CLUSTER_SYMBOLS[:n_clusters]
+        )
     }
     result["묶음"] = result["cluster_raw"].map(label_map)
 
@@ -121,7 +126,9 @@ def run_clustering(df, selected_attrs):
 # 제목
 # --------------------------------------------------
 st.title("🎬 영화 유형 나누기")
-st.caption("영화의 흥행·상영 특성을 바탕으로 비슷한 영화끼리 3개 유형으로 묶어 봅니다.")
+st.caption(
+    "영화의 흥행·상영 특성을 바탕으로 비슷한 영화끼리 선택한 수의 유형으로 묶어 봅니다."
+)
 
 try:
     df, total_count, clustered_count = load_data()
@@ -148,25 +155,72 @@ if len(selected_attrs) < 2:
     st.warning("속성을 2개 이상 골라 주세요.")
     st.stop()
 
-clustered_df = run_clustering(df, selected_attrs)
+# --------------------------------------------------
+# 묶음 수 선택
+# --------------------------------------------------
+st.subheader("2. 묶음 수 선택")
+n_clusters = st.slider(
+    "몇 개의 유형으로 나눌까요?",
+    min_value=2,
+    max_value=7,
+    value=3,
+    step=1,
+)
+
+clustered_df = run_clustering(df, selected_attrs, n_clusters)
+cluster_order = CLUSTER_SYMBOLS[:n_clusters]
+
+# 선택한 속성을 표준화한 값
+scaler = StandardScaler()
+x_standardized = scaler.fit_transform(df[selected_attrs])
+
+# --------------------------------------------------
+# 1~7개 묶음의 중심에서의 거리 제곱합
+# --------------------------------------------------
+inertia_rows = []
+for k in range(1, 8):
+    model_k = KMeans(n_clusters=k, random_state=42, n_init=10)
+    model_k.fit(x_standardized)
+    inertia_rows.append(
+        {
+            "묶음 수": k,
+            "중심에서의 거리 제곱합": model_k.inertia_,
+        }
+    )
+
+inertia_df = pd.DataFrame(inertia_rows)
+inertia_df["직전 값 대비 감소량"] = (
+    inertia_df["중심에서의 거리 제곱합"].shift(1)
+    - inertia_df["중심에서의 거리 제곱합"]
+)
+
+# --------------------------------------------------
+# 선택한 묶음 수의 실루엣 점수
+# --------------------------------------------------
+silhouette_model = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+silhouette_labels = silhouette_model.fit_predict(x_standardized)
+silhouette = silhouette_score(x_standardized, silhouette_labels)
 
 # --------------------------------------------------
 # 2차원 산점도
 # --------------------------------------------------
-st.subheader("2. 2차원 산점도")
+st.subheader("3. 2차원 산점도")
 col1, col2 = st.columns(2)
 with col1:
     x_attr = st.selectbox("가로축(X)", selected_attrs, index=0)
 with col2:
-    y_default = 1 if len(selected_attrs) > 1 else 0
-    y_attr = st.selectbox("세로축(Y)", selected_attrs, index=y_default)
+    y_attr = st.selectbox(
+        "세로축(Y)",
+        selected_attrs,
+        index=1,
+    )
 
 fig_2d = px.scatter(
     clustered_df,
     x=x_attr,
     y=y_attr,
     color="묶음",
-    category_orders={"묶음": ["㉮", "㉯", "㉰"]},
+    category_orders={"묶음": cluster_order},
     hover_name="movieNm",
     hover_data={
         "movieNm": False,
@@ -174,7 +228,11 @@ fig_2d = px.scatter(
         y_attr: ":.2f",
         "묶음": True,
     },
-    labels={x_attr: ATTR_LABELS[x_attr], y_attr: ATTR_LABELS[y_attr], "묶음": "유형"},
+    labels={
+        x_attr: ATTR_LABELS[x_attr],
+        y_attr: ATTR_LABELS[y_attr],
+        "묶음": "유형",
+    },
     title=f"{ATTR_LABELS[x_attr]} × {ATTR_LABELS[y_attr]}",
 )
 fig_2d.update_traces(marker={"size": 8})
@@ -184,7 +242,7 @@ st.plotly_chart(fig_2d, use_container_width=True)
 # --------------------------------------------------
 # 3차원 산점도
 # --------------------------------------------------
-st.subheader("3. 3차원 산점도")
+st.subheader("4. 3차원 산점도")
 if len(selected_attrs) < 3:
     st.info("3차원 산점도를 보려면 유형을 나눌 속성을 3개 이상 선택해 주세요.")
 else:
@@ -202,7 +260,7 @@ else:
         y=z_y,
         z=z_z,
         color="묶음",
-        category_orders={"묶음": ["㉮", "㉯", "㉰"]},
+        category_orders={"묶음": cluster_order},
         hover_name="movieNm",
         hover_data={
             "movieNm": False,
@@ -226,7 +284,7 @@ else:
 # --------------------------------------------------
 # 묶음별 평균 표
 # --------------------------------------------------
-st.subheader("4. 묶음별 특징")
+st.subheader("5. 묶음별 특징")
 
 summary = (
     clustered_df.groupby("묶음")
@@ -237,7 +295,7 @@ summary = (
         십위권일수_평균=("days_in_top10", "mean"),
         롱런지수_평균=("롱런 지수", "mean"),
     )
-    .reindex(["㉮", "㉯", "㉰"])
+    .reindex(cluster_order)
     .reset_index()
 )
 
@@ -253,29 +311,82 @@ summary_display = summary.rename(
 )
 
 summary_display["스크린 수 평균"] = summary_display["스크린 수 평균"].round(1)
-summary_display["누적 관객 평균"] = summary_display["누적 관객 평균"].round(0).astype("Int64")
+summary_display["누적 관객 평균"] = (
+    summary_display["누적 관객 평균"].round(0).astype("Int64")
+)
 summary_display["10위권 일수 평균"] = summary_display["10위권 일수 평균"].round(1)
 summary_display["롱런 지수 평균"] = summary_display["롱런 지수 평균"].round(2)
 
 st.dataframe(summary_display, use_container_width=True, hide_index=True)
 
 # --------------------------------------------------
-# 유형별 누적 관객 상위 5편
+# 묶음별 누적 관객 상위 5편
 # --------------------------------------------------
-st.subheader("5. 유형별 누적 관객 상위 5편")
+st.subheader("6. 묶음별 누적 관객 상위 5편")
 
-for group in ["㉮", "㉯", "㉰"]:
-    group_movies = (
-        clustered_df[clustered_df["묶음"] == group]
+cols = st.columns(n_clusters)
+for col, symbol in zip(cols, cluster_order):
+    top_movies = (
+        clustered_df[clustered_df["묶음"] == symbol]
         .sort_values("total_audi", ascending=False)
-        .head(5)[["movieNm", "total_audi"]]
-        .copy()
+        .head(5)
     )
 
-    st.markdown(f"**{group} 유형**")
-    if group_movies.empty:
-        st.write("해당 유형에 영화가 없습니다.")
-    else:
-        group_movies = group_movies.rename(columns={"movieNm": "영화 제목", "total_audi": "누적 관객"})
-        group_movies["누적 관객"] = group_movies["누적 관객"].round(0).astype("Int64")
-        st.dataframe(group_movies, use_container_width=True, hide_index=True)
+    with col:
+        st.markdown(f"### {symbol}")
+        for i, row in enumerate(top_movies.itertuples(index=False), start=1):
+            st.write(f"{i}. {row.movieNm} ({row.total_audi:,.0f}명)")
+
+# --------------------------------------------------
+# 묶음 수에 따른 거리 제곱합
+# --------------------------------------------------
+st.subheader("7. 묶음 수에 따른 거리 제곱합")
+st.caption(
+    "선택한 속성을 표준화한 뒤, 각 묶음 안에서 영화가 중심에서 떨어진 거리의 제곱을 모두 더한 값입니다."
+)
+
+fig_elbow = px.line(
+    inertia_df,
+    x="묶음 수",
+    y="중심에서의 거리 제곱합",
+    markers=True,
+    labels={
+        "묶음 수": "묶음 수",
+        "중심에서의 거리 제곱합": "중심에서의 거리 제곱합",
+    },
+    title="1~7개 묶음의 중심에서의 거리 제곱합",
+)
+fig_elbow.add_vline(
+    x=n_clusters,
+    line_dash="dash",
+    annotation_text=f"현재: {n_clusters}개",
+    annotation_position="top right",
+)
+fig_elbow.update_xaxes(dtick=1)
+fig_elbow.update_layout(height=500)
+st.plotly_chart(fig_elbow, use_container_width=True)
+
+inertia_table = inertia_df.copy()
+inertia_table["중심에서의 거리 제곱합"] = inertia_table[
+    "중심에서의 거리 제곱합"
+].round(2)
+inertia_table["직전 값 대비 감소량"] = inertia_table[
+    "직전 값 대비 감소량"
+].round(2)
+inertia_table["직전 값 대비 감소량"] = inertia_table[
+    "직전 값 대비 감소량"
+].astype("Float64")
+inertia_table["직전 값 대비 감소량"] = inertia_table[
+    "직전 값 대비 감소량"
+].mask(inertia_table["묶음 수"] == 1, pd.NA)
+
+st.dataframe(inertia_table, use_container_width=True, hide_index=True)
+
+# --------------------------------------------------
+# 실루엣 점수
+# --------------------------------------------------
+st.subheader("8. 현재 묶음 수의 실루엣 점수")
+st.write(f"**현재 {n_clusters}개 묶음의 실루엣 점수:** {silhouette:.3f}")
+st.caption(
+    "실루엣 점수는 -1에서 1 사이이며, 1에 가까울수록 묶음이 뚜렷하게 나뉜다는 뜻입니다."
+)
